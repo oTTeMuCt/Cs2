@@ -9,7 +9,6 @@ class SimpleScanner:
         self.lock = threading.Lock()
     
     def scan_port(self, port):
-        """Сканирует один порт"""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(0.5)
@@ -23,7 +22,6 @@ class SimpleScanner:
             pass
     
     def scan_range(self, start_port, end_port):
-        """Сканирует диапазон портов"""
         print(f"\n[*] Сканирование {self.target} (порты {start_port}-{end_port})")
         print(f"[*] Начато: {datetime.now().strftime('%H:%M:%S')}\n")
         
@@ -46,7 +44,6 @@ class SimpleScanner:
         self.show_results()
     
     def scan_popular(self):
-        """Сканирует популярные порты"""
         popular_ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 993, 995, 3306, 3389, 8080]
         print(f"\n[*] Сканирование популярных портов на {self.target}\n")
         
@@ -56,7 +53,6 @@ class SimpleScanner:
         self.show_results()
     
     def show_results(self):
-
         print("\n" + "="*50)
         print(f"РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ: {self.target}")
         print("="*50)
@@ -82,7 +78,6 @@ class SimpleScanner:
         return services.get(port, "Unknown")
     
     def save_results(self, filename="scan_results.txt"):
-        """Сохраняет результаты в файл"""
         with open(filename, 'w') as f:
             f.write(f"Scan Results for {self.target}\n")
             f.write(f"Date: {datetime.now()}\n")
