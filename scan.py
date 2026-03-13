@@ -7,9 +7,95 @@ import subprocess
 import re
 from datetime import datetime
 from collections import defaultdict
-from scapy.all import sniff, IP, TCP, UDP, ICMP
+from scapy.all import sniff, IP, TCP, UDP, ICMP, Raw
 import os
 import time
+import requests
+from concurrent.futures import ThreadPoolExecutor
+
+
+class GeoIPLookup:
+    """Класс для определения геолокации по IP"""
+    
+    def __init__(self):
+        self.cache = {}
+        self.api_urls = [
+            "http://ip-api.com/json/",
+            "http://ipapi.co/{}/json/",
+        ]
+    
+    def get_location(self, ip):
+        """Получение информации о местоположении IP"""
+        # Проверяем кэш
+        if ip in self.cache:
+            return self.cache[ip]
+        
+        # Локальные адреса
+        if ip in ['127.0.0.1', 'localhost']:
+            info = {
+                'country': 'Local',
+                'city': 'Localhost',
+                'org': 'Local Machine',
+                'isp': 'Local',
+                'status': 'success'
+            }
+            self.cache[ip] = info
+            return info
+        
+        # Приватные IP
+        if ip.startswith(('192.168.', '10.', '172.16.', '172.17.', 
+                          '172.18.', '172.19.', '172.20.', '172.21.',
+                          '172.22.', '172.23.', '172.24.', '172.25.',
+                          '172.26.', '172.27.', '172.28.', '172.29.',
+                          '172.30.', '172.31.')):
+            info = {
+                'country': 'Private Network',
+                'city': 'Local Network',
+                'org': 'Private IP',
+                'isp': 'Local Network',
+                'status': 'success'
+            }
+            self.cache[ip] = info
+            return info
+        
+        # Пробуем API
+        for api_url in self.api_urls:
+            try:
+                if '{}' in api_url:
+                    url = api_url.format(ip)
+                else:
+                    url = api_url + ip
+                
+                response = requests.get(url, timeout=3)
+                data = response.json()
+                
+                if data.get('status') == 'success':
+                    info = {
+                        'country': data.get('country', 'Unknown'),
+                        'city': data.get('city', 'Unknown'),
+                        'org': data.get('org', data.get('isp', 'Unknown')),
+                        'isp': data.get('isp', 'Unknown'),
+                        'region': data.get('regionName', 'Unknown'),
+                        'zip': data.get('zip', 'Unknown'),
+                        'timezone': data.get('timezone', 'Unknown'),
+                        'status': 'success'
+                    }
+                    self.cache[ip] = info
+                    return info
+                    
+            except:
+                continue
+        
+        # Если все API не сработали
+        info = {
+            'country': 'Unknown',
+            'city': 'Unknown',
+            'org': 'Unknown',
+            'isp': 'Unknown',
+            'status': 'error'
+        }
+        self.cache[ip] = info
+        return info
 
 
 class NetworkScanner:
@@ -22,13 +108,23 @@ class NetworkScanner:
             'count': 0, 
             'ports': set(), 
             'first_seen': None, 
-            'last_seen': None
+            'last_seen': None,
+            'total_bytes': 0,  # Общий объем трафика
+            'packet_sizes': [],  # Размеры пакетов
+            'protocols': defaultdict(int),
+            'flags': defaultdict(int),
+            'icmp_count': 0,  # Количество ping (ICMP)
+            'tcp_count': 0,
+            'udp_count': 0
         })
         self.blocked_ips = set()
         self.connection_lock = threading.Lock()
         self.progress_callback = None
         self.current_port = 0
         self.total_ports = 0
+        self.geo_lookup = GeoIPLookup()
+        self.total_packets = 0
+        self.total_bytes = 0
         
     def scan_port(self, ip, port, timeout=0.5):
         """Сканирование одного порта"""
@@ -129,11 +225,18 @@ class NetworkScanner:
         return info
     
     def detect_ddos_packet(self, packet):
-        """Обработка пакета для обнаружения DDoS атак"""
+        """Обработка пакета для обнаружения DDoS атак с учетом объема"""
         if IP in packet:
             src_ip = packet[IP].src
+            dst_ip = packet[IP].dst
+            
+            # Считаем размер пакета
+            packet_size = len(packet)
             
             with self.connection_lock:
+                self.total_packets += 1
+                self.total_bytes += packet_size
+                
                 if src_ip not in self.suspicious_ips:
                     self.suspicious_ips[src_ip] = {
                         'count': 0,
@@ -141,45 +244,119 @@ class NetworkScanner:
                         'first_seen': datetime.now(),
                         'last_seen': datetime.now(),
                         'protocols': defaultdict(int),
-                        'flags': defaultdict(int)
+                        'flags': defaultdict(int),
+                        'total_bytes': 0,
+                        'packet_sizes': [],
+                        'icmp_count': 0,
+                        'tcp_count': 0,
+                        'udp_count': 0,
+                        'src_ip': src_ip,
+                        'dst_ip': dst_ip
                     }
                 
                 ip_data = self.suspicious_ips[src_ip]
                 ip_data['count'] += 1
                 ip_data['last_seen'] = datetime.now()
+                ip_data['total_bytes'] += packet_size
+                ip_data['packet_sizes'].append(packet_size)
                 
-                if TCP in packet:
+                # Ограничиваем хранение размеров пакетов (последние 100)
+                if len(ip_data['packet_sizes']) > 100:
+                    ip_data['packet_sizes'] = ip_data['packet_sizes'][-100:]
+                
+                # Определяем тип трафика
+                if ICMP in packet:
+                    ip_data['protocols']['ICMP'] += 1
+                    ip_data['icmp_count'] += 1
+                    # Проверяем это ping (ICMP Echo Request)
+                    if packet[ICMP].type == 8:
+                        ip_data['is_ping'] = True
+                    
+                elif TCP in packet:
                     ip_data['protocols']['TCP'] += 1
+                    ip_data['tcp_count'] += 1
+                    ip_data['flags'][str(packet[TCP].flags)] += 1
                     ip_data['ports'].add(packet[TCP].dport)
+                    
                 elif UDP in packet:
                     ip_data['protocols']['UDP'] += 1
+                    ip_data['udp_count'] += 1
                     ip_data['ports'].add(packet[UDP].dport)
-                elif ICMP in packet:
-                    ip_data['protocols']['ICMP'] += 1
     
-    def get_suspicious_ips_list(self, threshold=100):
-        """Получение списка подозрительных IP"""
+    def get_ip_location(self, ip):
+        """Получение геолокации для IP"""
+        return self.geo_lookup.get_location(ip)
+    
+    def get_suspicious_ips_list(self, threshold=10):
+        """Получение списка подозрительных IP с объемом трафика"""
         suspicious = []
         current_time = datetime.now()
         
         for ip, data in self.suspicious_ips.items():
             time_diff = (current_time - data['first_seen']).total_seconds()
             
-            if (data['count'] > threshold or 
-                len(data['ports']) > 10 or
-                (time_diff > 0 and data['count'] / time_diff > 10)):
+            # Вычисляем средний размер пакета
+            avg_packet_size = sum(data['packet_sizes']) / len(data['packet_sizes']) if data['packet_sizes'] else 0
+            
+            # Вычисляем скорость (пакетов в секунду)
+            packets_per_second = data['count'] / time_diff if time_diff > 0 else 0
+            
+            # Вычисляем объем трафика в секунду
+            bytes_per_second = data['total_bytes'] / time_diff if time_diff > 0 else 0
+            
+            # Определяем подозрительность
+            is_suspicious = (
+                data['count'] > threshold or 
+                len(data['ports']) > 3 or
+                packets_per_second > 2 or
+                data['total_bytes'] > 10000 or  # Больше 10KB
+                data['icmp_count'] > 20  # Много ping запросов
+            )
+            
+            if is_suspicious:
+                # Определяем тип атаки
+                attack_type = "Unknown"
+                if data['icmp_count'] > data['count'] * 0.8:
+                    attack_type = "ICMP Flood (Ping)"
+                elif data['tcp_count'] > data['count'] * 0.8:
+                    attack_type = "TCP Flood"
+                elif data['udp_count'] > data['count'] * 0.8:
+                    attack_type = "UDP Flood"
+                elif len(data['ports']) > 10:
+                    attack_type = "Port Scanning"
+                
+                # Получаем геолокацию
+                location = self.get_ip_location(ip)
                 
                 suspicious.append({
                     'ip': ip,
                     'packet_count': data['count'],
                     'ports_scanned': len(data['ports']),
+                    'total_bytes': data['total_bytes'],
+                    'avg_packet_size': int(avg_packet_size),
+                    'bytes_per_second': int(bytes_per_second),
                     'first_seen': data['first_seen'].strftime('%Y-%m-%d %H:%M:%S'),
                     'last_seen': data['last_seen'].strftime('%Y-%m-%d %H:%M:%S'),
                     'protocols': dict(data['protocols']),
-                    'threat_level': 'HIGH' if data['count'] > 500 else 'MEDIUM'
+                    'threat_level': 'HIGH' if data['count'] > 50 or data['total_bytes'] > 50000 else 'MEDIUM',
+                    'country': location.get('country', 'Unknown'),
+                    'city': location.get('city', 'Unknown'),
+                    'isp': location.get('isp', 'Unknown'),
+                    'attack_type': attack_type,
+                    'is_ping': data.get('is_ping', False)
                 })
         
-        return sorted(suspicious, key=lambda x: x['packet_count'], reverse=True)
+        return sorted(suspicious, key=lambda x: (x['packet_count'], x['total_bytes']), reverse=True)
+    
+    def get_traffic_stats(self):
+        """Получение общей статистики трафика"""
+        return {
+            'total_packets': self.total_packets,
+            'total_bytes': self.total_bytes,
+            'total_mb': round(self.total_bytes / (1024 * 1024), 2),
+            'unique_ips': len(self.suspicious_ips),
+            'suspicious_count': len(self.get_suspicious_ips_list())
+        }
     
     def block_ip(self, ip):
         """Блокировка IP адреса"""
@@ -227,7 +404,7 @@ class ScannerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Network Scanner - DDoS Detection & IP Blocker")
-        self.root.geometry("1400x850")
+        self.root.geometry("1600x900")
         self.root.configure(bg='#f0f0f0')
         
         self.scanner = NetworkScanner()
@@ -263,6 +440,12 @@ class ScannerGUI:
                                          padx=15, pady=8, font=('Arial', 9, 'bold'))
         self.start_sniff_btn.pack(side=tk.LEFT, padx=5, pady=10)
         
+        self.stats_btn = tk.Button(top_frame, text="📊 Статистика", 
+                                   command=self.show_traffic_stats,
+                                   bg='#95a5a6', fg='white', relief='flat', 
+                                   padx=15, pady=8, font=('Arial', 9, 'bold'))
+        self.stats_btn.pack(side=tk.LEFT, padx=5, pady=10)
+        
         self.block_btn = tk.Button(top_frame, text="🚫 Заблокировать IP", 
                                    command=self.block_selected_ip,
                                    bg='#e67e22', fg='white', relief='flat', 
@@ -287,7 +470,7 @@ class ScannerGUI:
         
         tk.Label(input_frame, text="IP:", bg='#2c3e50', fg='white', font=('Arial', 9, 'bold')).pack(side=tk.LEFT)
         self.ip_entry = tk.Entry(input_frame, width=15, font=('Arial', 9))
-        self.ip_entry.insert(0, "192.168.1.1")
+        self.ip_entry.insert(0, "127.0.0.1")
         self.ip_entry.pack(side=tk.LEFT, padx=5)
         
         tk.Label(input_frame, text="Порты:", bg='#2c3e50', fg='white', font=('Arial', 9, 'bold')).pack(side=tk.LEFT, padx=(15,5))
@@ -338,6 +521,41 @@ class ScannerGUI:
                              font=('Arial', 9))
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
     
+    def show_traffic_stats(self):
+        """Показать расширенную статистику трафика"""
+        stats = self.scanner.get_traffic_stats()
+        
+        # Получаем топ IP
+        suspicious = self.scanner.get_suspicious_ips_list()
+        
+        stats_text = f"""
+        📊 РАСШИРЕННАЯ СТАТИСТИКА ТРАФИКА
+        
+        💾 Общий объем:
+        • Пакетов всего: {stats['total_packets']}
+        • Байт всего: {stats['total_bytes']:,} ({stats['total_mb']} MB)
+        • Уникальных IP: {stats['unique_ips']}
+        • Подозрительных: {stats['suspicious_count']}
+        
+        """
+        
+        if suspicious:
+            stats_text += "🎯 ТОП-5 подозрительных IP:\n\n"
+            for i, ip_data in enumerate(suspicious[:5], 1):
+                ping_mark = "🏓 PING" if ip_data.get('is_ping') else ""
+                stats_text += f"""{i}. {ip_data['ip']} {ping_mark}
+   Страна: {ip_data['country']}, {ip_data['city']}
+   Пакетов: {ip_data['packet_count']}, Объем: {ip_data['total_bytes']:,} байт
+   Скорость: {ip_data['bytes_per_second']:,} байт/сек
+   Атака: {ip_data['attack_type']}
+   Угроза: {ip_data['threat_level']}
+
+"""
+        else:
+            stats_text += " Подозрительных IP пока нет\n"
+        
+        messagebox.showinfo("📊 Статистика трафика", stats_text)
+    
     def create_table_section(self, parent, title, table_id):
         """Создание секции с таблицей"""
         frame = tk.LabelFrame(parent, text=title, bg='#ecf0f1', padx=5, pady=5, 
@@ -352,9 +570,9 @@ class ScannerGUI:
             col_widths = (120, 150, 120, 100, 150, 140)
             headings = ('IP адрес', 'Hostname', 'MAC адрес', 'Портов', 'Сервисы', 'Время')
         elif table_id == 1:
-            columns = ('ip', 'packets', 'ports', 'threat', 'first_seen', 'last_seen')
-            col_widths = (140, 80, 80, 80, 140, 140)
-            headings = ('IP адрес', 'Пакетов', 'Портов', 'Угроза', 'Первый', 'Последний')
+            columns = ('ip', 'country', 'packets', 'bytes', 'bps', 'attack', 'threat', 'ping')
+            col_widths = (130, 120, 80, 100, 100, 120, 80, 60)
+            headings = ('IP адрес', 'Страна/Город', 'Пакетов', 'Объем (байт)', 'Байт/сек', 'Тип атаки', 'Угроза', 'Ping')
         else:
             columns = ('ip', 'blocked_time', 'reason')
             col_widths = (200, 180, 250)
@@ -387,7 +605,6 @@ class ScannerGUI:
     def update_progress(self, current, total):
         """Обновление прогресс-бара"""
         try:
-         # Ограничиваем процент от 0 до 100
             percentage = min(int((current / total) * 100), 100)
             self.progress_bar['value'] = percentage
             self.progress_value_label.config(text=f"{percentage}%")
@@ -395,6 +612,7 @@ class ScannerGUI:
             self.root.update_idletasks()
         except:
             pass
+    
     def animate_scanning(self):
         """Анимация индикатора активности"""
         if self.scan_animation_active:
@@ -510,10 +728,38 @@ class ScannerGUI:
     def _sniff_packets(self):
         """Функция захвата пакетов"""
         try:
-            sniff(prn=self.scanner.detect_ddos_packet, store=0, 
-                  filter="tcp or udp or icmp", timeout=300)
+            from scapy.all import conf
+            
+            # Проверяем доступность pcap
+            if not conf.use_pcap:
+                # Используем L3 socket для Windows без Npcap
+                from scapy.all import L3RawSocket
+                conf.L3socket = L3RawSocket
+            
+            # Захватываем пакеты
+            sniff(prn=self.scanner.detect_ddos_packet, 
+                  store=0, 
+                  filter="tcp or udp or icmp", 
+                  timeout=300,
+                  iface=None)
+              
+        except PermissionError:
+            self.root.after(0, lambda: messagebox.showerror(
+                "Ошибка прав доступа", 
+                "Запустите программу от имени Администратора!"
+            ))
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Ошибка захвата", str(e)))
+            error_msg = str(e)
+            if "winpcap" in error_msg.lower() or "npcap" in error_msg.lower():
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Требуется Npcap",
+                    "Для захвата пакетов необходим Npcap!\n\n"
+                    "1. Скачайте: https://npcap.com/\n"
+                    "2. Установите с опцией 'WinPcap API-compatible Mode'\n"
+                    "3. Перезапустите программу"
+                ))
+            else:
+                self.root.after(0, lambda: messagebox.showerror("Ошибка захвата", f"{error_msg}"))
     
     def stop_sniffing(self):
         """Остановка захвата трафика"""
@@ -524,20 +770,30 @@ class ScannerGUI:
         self.update_suspicious_table()
     
     def update_suspicious_table(self):
-        """Обновление таблицы подозрительных IP"""
+        """Обновление таблицы подозрительных IP с геолокацией и объемом"""
         for item in self.suspicious_table.get_children():
             self.suspicious_table.delete(item)
             
         suspicious = self.scanner.get_suspicious_ips_list()
         
         for ip_data in suspicious:
+            # Форматируем страну и город
+            location = f"{ip_data['country']}, {ip_data['city']}"
+            if len(location) > 25:
+                location = location[:22] + "..."
+            
+            # Определяем это ping или нет
+            ping_mark = "🏓" if ip_data.get('is_ping') else ""
+            
             self.suspicious_table.insert('', 'end', values=(
                 ip_data['ip'],
+                location,
                 ip_data['packet_count'],
-                ip_data['ports_scanned'],
+                f"{ip_data['total_bytes']:,}",
+                f"{ip_data['bytes_per_second']:,}",
+                ip_data['attack_type'],
                 ip_data['threat_level'],
-                ip_data['first_seen'],
-                ip_data['last_seen']
+                ping_mark
             ))
     
     def block_selected_ip(self):
@@ -556,7 +812,7 @@ class ScannerGUI:
             self.blocked_table.insert('', 'end', values=(
                 ip,
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "Подозрительная активность (DDoS)"
+                f"Подозрительная активность (DDoS) - {item['values'][5]}"
             ))
             self.suspicious_table.delete(selection[0])
             messagebox.showinfo("Успех", msg)
@@ -601,6 +857,7 @@ class ScannerGUI:
             
         data = {
             'scan_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'traffic_stats': self.scanner.get_traffic_stats(),
             'all_ips': [],
             'suspicious_ips': [],
             'blocked_ips': []
@@ -621,11 +878,13 @@ class ScannerGUI:
             values = self.suspicious_table.item(item)['values']
             data['suspicious_ips'].append({
                 'ip': values[0],
-                'packet_count': values[1],
-                'ports_scanned': values[2],
-                'threat_level': values[3],
-                'first_seen': values[4],
-                'last_seen': values[5]
+                'location': values[1],
+                'packet_count': values[2],
+                'total_bytes': values[3].replace(',', ''),
+                'bytes_per_second': values[4].replace(',', ''),
+                'attack_type': values[5],
+                'threat_level': values[6],
+                'is_ping': values[7] == '🏓'
             })
             
         for item in self.blocked_table.get_children():
