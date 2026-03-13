@@ -11,11 +11,9 @@ from scapy.all import sniff, IP, TCP, UDP, ICMP, Raw
 import os
 import time
 import requests
-from concurrent.futures import ThreadPoolExecutor
 
 
 class GeoIPLookup:
-    """Класс для определения геолокации по IP"""
     
     def __init__(self):
         self.cache = {}
@@ -25,12 +23,9 @@ class GeoIPLookup:
         ]
     
     def get_location(self, ip):
-        """Получение информации о местоположении IP"""
-        # Проверяем кэш
         if ip in self.cache:
             return self.cache[ip]
         
-        # Локальные адреса
         if ip in ['127.0.0.1', 'localhost']:
             info = {
                 'country': 'Local',
@@ -42,7 +37,6 @@ class GeoIPLookup:
             self.cache[ip] = info
             return info
         
-        # Приватные IP
         if ip.startswith(('192.168.', '10.', '172.16.', '172.17.', 
                           '172.18.', '172.19.', '172.20.', '172.21.',
                           '172.22.', '172.23.', '172.24.', '172.25.',
@@ -58,7 +52,6 @@ class GeoIPLookup:
             self.cache[ip] = info
             return info
         
-        # Пробуем API
         for api_url in self.api_urls:
             try:
                 if '{}' in api_url:
@@ -86,7 +79,6 @@ class GeoIPLookup:
             except:
                 continue
         
-        # Если все API не сработали
         info = {
             'country': 'Unknown',
             'city': 'Unknown',
@@ -99,7 +91,6 @@ class GeoIPLookup:
 
 
 class NetworkScanner:
-    """Класс для сканирования сети и обнаружения атак"""
     
     def __init__(self):
         self.scanning = False
@@ -109,25 +100,21 @@ class NetworkScanner:
             'ports': set(), 
             'first_seen': None, 
             'last_seen': None,
-            'total_bytes': 0,  # Общий объем трафика
-            'packet_sizes': [],  # Размеры пакетов
+            'total_bytes': 0,  
+            'packet_sizes': [],  
             'protocols': defaultdict(int),
             'flags': defaultdict(int),
-            'icmp_count': 0,  # Количество ping (ICMP)
+            'icmp_count': 0, 
             'tcp_count': 0,
             'udp_count': 0
         })
         self.blocked_ips = set()
         self.connection_lock = threading.Lock()
-        self.progress_callback = None
-        self.current_port = 0
-        self.total_ports = 0
         self.geo_lookup = GeoIPLookup()
         self.total_packets = 0
         self.total_bytes = 0
         
     def scan_port(self, ip, port, timeout=0.5):
-        """Сканирование одного порта"""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
@@ -152,10 +139,7 @@ class NetworkScanner:
         return None
     
     def scan_ip_ports(self, ip, start_port=1, end_port=1000, threads=50):
-        """Многопоточное сканирование портов"""
         open_ports = []
-        self.current_port = start_port
-        self.total_ports = end_port - start_port + 1
         
         def worker(ports_to_scan):
             for port in ports_to_scan:
@@ -163,10 +147,6 @@ class NetworkScanner:
                 if result:
                     with self.connection_lock:
                         open_ports.append(result)
-                with self.connection_lock:
-                    self.current_port = port
-                    if self.progress_callback:
-                        self.progress_callback(self.current_port, self.total_ports)
         
         ports = list(range(start_port, end_port + 1))
         chunk_size = len(ports) // threads + 1
@@ -187,7 +167,6 @@ class NetworkScanner:
         return open_ports
     
     def get_mac_address(self, ip):
-        """Получение MAC-адреса"""
         try:
             if os.name == 'nt':
                 output = subprocess.check_output(['arp', '-a', ip], stderr=subprocess.STDOUT)
@@ -207,7 +186,6 @@ class NetworkScanner:
         return "N/A"
     
     def get_host_info(self, ip):
-        """Получение информации о хосте"""
         info = {
             'ip': ip,
             'hostname': 'N/A',
@@ -225,12 +203,11 @@ class NetworkScanner:
         return info
     
     def detect_ddos_packet(self, packet):
-        """Обработка пакета для обнаружения DDoS атак с учетом объема"""
         if IP in packet:
             src_ip = packet[IP].src
             dst_ip = packet[IP].dst
             
-            # Считаем размер пакета
+
             packet_size = len(packet)
             
             with self.connection_lock:
@@ -260,15 +237,12 @@ class NetworkScanner:
                 ip_data['total_bytes'] += packet_size
                 ip_data['packet_sizes'].append(packet_size)
                 
-                # Ограничиваем хранение размеров пакетов (последние 100)
                 if len(ip_data['packet_sizes']) > 100:
                     ip_data['packet_sizes'] = ip_data['packet_sizes'][-100:]
                 
-                # Определяем тип трафика
                 if ICMP in packet:
                     ip_data['protocols']['ICMP'] += 1
                     ip_data['icmp_count'] += 1
-                    # Проверяем это ping (ICMP Echo Request)
                     if packet[ICMP].type == 8:
                         ip_data['is_ping'] = True
                     
@@ -284,37 +258,31 @@ class NetworkScanner:
                     ip_data['ports'].add(packet[UDP].dport)
     
     def get_ip_location(self, ip):
-        """Получение геолокации для IP"""
         return self.geo_lookup.get_location(ip)
     
     def get_suspicious_ips_list(self, threshold=10):
-        """Получение списка подозрительных IP с объемом трафика"""
         suspicious = []
         current_time = datetime.now()
         
         for ip, data in self.suspicious_ips.items():
             time_diff = (current_time - data['first_seen']).total_seconds()
             
-            # Вычисляем средний размер пакета
             avg_packet_size = sum(data['packet_sizes']) / len(data['packet_sizes']) if data['packet_sizes'] else 0
             
-            # Вычисляем скорость (пакетов в секунду)
             packets_per_second = data['count'] / time_diff if time_diff > 0 else 0
             
-            # Вычисляем объем трафика в секунду
             bytes_per_second = data['total_bytes'] / time_diff if time_diff > 0 else 0
             
-            # Определяем подозрительность
+
             is_suspicious = (
                 data['count'] > threshold or 
                 len(data['ports']) > 3 or
                 packets_per_second > 2 or
-                data['total_bytes'] > 10000 or  # Больше 10KB
-                data['icmp_count'] > 20  # Много ping запросов
+                data['total_bytes'] > 10000 or 
+                data['icmp_count'] > 20  
             )
             
             if is_suspicious:
-                # Определяем тип атаки
                 attack_type = "Unknown"
                 if data['icmp_count'] > data['count'] * 0.8:
                     attack_type = "ICMP Flood (Ping)"
@@ -325,7 +293,6 @@ class NetworkScanner:
                 elif len(data['ports']) > 10:
                     attack_type = "Port Scanning"
                 
-                # Получаем геолокацию
                 location = self.get_ip_location(ip)
                 
                 suspicious.append({
@@ -349,7 +316,6 @@ class NetworkScanner:
         return sorted(suspicious, key=lambda x: (x['packet_count'], x['total_bytes']), reverse=True)
     
     def get_traffic_stats(self):
-        """Получение общей статистики трафика"""
         return {
             'total_packets': self.total_packets,
             'total_bytes': self.total_bytes,
@@ -359,7 +325,6 @@ class NetworkScanner:
         }
     
     def block_ip(self, ip):
-        """Блокировка IP адреса"""
         try:
             if os.name == 'nt':
                 cmd = f'netsh advfirewall firewall add rule name="Block_{ip}" dir=in action=block remoteip={ip}'
@@ -374,7 +339,6 @@ class NetworkScanner:
             return False, f"Ошибка блокировки: {str(e)}"
     
     def unblock_ip(self, ip):
-        """Разблокировка IP адреса"""
         try:
             if os.name == 'nt':
                 cmd = f'netsh advfirewall firewall delete rule name="Block_{ip}"'
@@ -389,7 +353,6 @@ class NetworkScanner:
             return False, f"Ошибка разблокировки: {str(e)}"
     
     def save_to_json(self, filename, data):
-        """Сохранение результатов в JSON"""
         try:
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
@@ -399,7 +362,6 @@ class NetworkScanner:
 
 
 class ScannerGUI:
-    """Графический интерфейс приложения"""
     
     def __init__(self, root):
         self.root = root
@@ -415,13 +377,10 @@ class ScannerGUI:
         self.setup_ui()
     
     def setup_ui(self):
-        """Настройка пользовательского интерфейса"""
-        # Верхняя панель с кнопками
         top_frame = tk.Frame(self.root, bg='#2c3e50', height=80)
         top_frame.pack(fill=tk.X, padx=5, pady=5)
         top_frame.pack_propagate(False)
         
-        # Кнопки управления
         self.start_scan_btn = tk.Button(top_frame, text="🔍 Начать сканирование", 
                                         command=self.start_scan,
                                         bg='#3498db', fg='white', relief='flat', 
@@ -464,7 +423,6 @@ class ScannerGUI:
                                   padx=15, pady=8, font=('Arial', 9, 'bold'))
         self.save_btn.pack(side=tk.LEFT, padx=5, pady=10)
         
-        # Поля ввода
         input_frame = tk.Frame(top_frame, bg='#2c3e50')
         input_frame.pack(side=tk.RIGHT, padx=20)
         
@@ -482,30 +440,20 @@ class ScannerGUI:
         self.port_end.insert(0, "1000")
         self.port_end.pack(side=tk.LEFT)
         
-        # Панель прогресса сканирования
-        progress_frame = tk.Frame(self.root, bg='#ecf0f1', height=40)
-        progress_frame.pack(fill=tk.X, padx=5, pady=5)
-        progress_frame.pack_propagate(False)
+
+        indicator_frame = tk.Frame(self.root, bg='#ecf0f1', height=40)
+        indicator_frame.pack(fill=tk.X, padx=5, pady=5)
+        indicator_frame.pack_propagate(False)
         
-        self.progress_label = tk.Label(progress_frame, text="Готов к сканированию", 
-                                       bg='#ecf0f1', fg='#2c3e50', font=('Arial', 10, 'bold'))
-        self.progress_label.pack(side=tk.LEFT, padx=10)
+        self.status_label = tk.Label(indicator_frame, text="Готов к сканированию", 
+                                     bg='#ecf0f1', fg='#2c3e50', font=('Arial', 11, 'bold'))
+        self.status_label.pack(side=tk.LEFT, padx=10)
         
-        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', length=600)
-        self.progress_bar.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
-        
-        self.progress_value_label = tk.Label(progress_frame, text="0%", 
-                                             bg='#ecf0f1', fg='#2c3e50', 
-                                             font=('Arial', 10, 'bold'), width=6)
-        self.progress_value_label.pack(side=tk.LEFT, padx=10)
-        
-        # Индикатор активности (мигающий)
-        self.activity_indicator = tk.Label(progress_frame, text="●", 
+        self.activity_indicator = tk.Label(indicator_frame, text="●", 
                                            bg='#ecf0f1', fg='#95a5a6', 
                                            font=('Arial', 16, 'bold'))
         self.activity_indicator.pack(side=tk.LEFT, padx=10)
         
-        # Основная область с тремя таблицами
         main_frame = tk.Frame(self.root, bg='#f0f0f0')
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
@@ -513,7 +461,6 @@ class ScannerGUI:
         self.create_table_section(main_frame, "Подозрительные IP (DDoS)", 1)
         self.create_table_section(main_frame, "Заблокированные IP", 2)
         
-        # Статус бар
         self.status_var = tk.StringVar()
         self.status_var.set("✓ Готов к работе | Захват трафика: выключен")
         status_bar = tk.Label(self.root, textvariable=self.status_var, 
@@ -522,10 +469,10 @@ class ScannerGUI:
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
     
     def show_traffic_stats(self):
-        """Показать расширенную статистику трафика"""
+
         stats = self.scanner.get_traffic_stats()
         
-        # Получаем топ IP
+
         suspicious = self.scanner.get_suspicious_ips_list()
         
         stats_text = f"""
@@ -557,7 +504,6 @@ class ScannerGUI:
         messagebox.showinfo("📊 Статистика трафика", stats_text)
     
     def create_table_section(self, parent, title, table_id):
-        """Создание секции с таблицей"""
         frame = tk.LabelFrame(parent, text=title, bg='#ecf0f1', padx=5, pady=5, 
                              font=('Arial', 10, 'bold'))
         frame.grid(row=table_id // 2, column=table_id % 2, sticky='nsew', padx=5, pady=5)
@@ -602,19 +548,7 @@ class ScannerGUI:
         else:
             self.blocked_table = tree
     
-    def update_progress(self, current, total):
-        """Обновление прогресс-бара"""
-        try:
-            percentage = min(int((current / total) * 100), 100)
-            self.progress_bar['value'] = percentage
-            self.progress_value_label.config(text=f"{percentage}%")
-            self.progress_label.config(text=f"Сканирование порта {current} из {total}")
-            self.root.update_idletasks()
-        except:
-            pass
-    
     def animate_scanning(self):
-        """Анимация индикатора активности"""
         if self.scan_animation_active:
             current_color = self.activity_indicator.cget('fg')
             new_color = '#2ecc71' if current_color == '#e74c3c' else '#e74c3c'
@@ -622,7 +556,6 @@ class ScannerGUI:
             self.root.after(500, self.animate_scanning)
     
     def start_scan(self):
-        """Запуск сканирования"""
         if self.scanner.scanning:
             messagebox.showwarning("Внимание", "Сканирование уже выполняется")
             return
@@ -635,30 +568,21 @@ class ScannerGUI:
             messagebox.showerror("Ошибка", "Неверный диапазон портов")
             return
         
-        # Визуальная индикация начала сканирования
         self.scanner.scanning = True
         self.scan_animation_active = True
         self.start_scan_btn.config(bg='#95a5a6', state='disabled')
-        self.progress_bar['maximum'] = 100
-        self.progress_bar['value'] = 0
-        self.progress_label.config(text=f"Начало сканирования {ip}...")
-        self.progress_value_label.config(text="0%")
+        self.status_label.config(text=f"⚡ Сканирование {ip} (порты {start_port}-{end_port})...")
         self.status_var.set(f"⚡ Сканирование {ip} (порты {start_port}-{end_port})...")
         
-        # Запуск анимации
         self.animate_scanning()
         
-        # Запуск сканирования в потоке
+
         scan_thread = threading.Thread(target=self._run_scan, args=(ip, start_port, end_port))
         scan_thread.daemon = True
         scan_thread.start()
     
     def _run_scan(self, ip, start_port, end_port):
-        """Выполнение сканирования в фоне"""
         try:
-            # Устанавливаем callback для обновления прогресса
-            self.scanner.progress_callback = self.update_progress
-            
             open_ports = self.scanner.scan_ip_ports(ip, start_port, end_port)
             host_info = self.scanner.get_host_info(ip)
             
@@ -678,15 +602,13 @@ class ScannerGUI:
             self.root.after(0, self.scan_complete)
     
     def scan_complete(self):
-        """Завершение сканирования"""
         self.start_scan_btn.config(bg='#3498db', state='normal')
         self.activity_indicator.config(fg='#27ae60')  # Зеленый - готов
-        self.progress_label.config(text="✓ Сканирование завершено")
+        self.status_label.config(text="✓ Сканирование завершено")
         self.status_var.set("✓ Готов к работе | Сканирование завершено")
         messagebox.showinfo("Готово", "Сканирование завершено!")
     
     def add_to_all_ips_table(self, ip, host_info, open_ports, services):
-        """Добавление результата в таблицу всех IP"""
         existing = self.all_ips_table.get_children()
         for item in existing:
             if self.all_ips_table.item(item)['values'][0] == ip:
@@ -703,18 +625,17 @@ class ScannerGUI:
         ))
     
     def toggle_sniffing(self):
-        """Включение/выключение захвата трафика"""
         if self.sniffing:
             self.stop_sniffing()
         else:
             self.start_sniffing()
     
     def start_sniffing(self):
-        """Запуск захвата трафика"""
         try:
             self.sniffing = True
             self.start_sniff_btn.config(text="⏹ Остановить захват", bg='#e74c3c')
             self.status_var.set("📡 Захват трафика АКТИВЕН | Анализ пакетов...")
+            self.status_label.config(text="📡 Захват трафика АКТИВЕН")
             self.activity_indicator.config(fg='#e74c3c')  # Красный - активно
             
             self.sniff_thread = threading.Thread(target=self._sniff_packets)
@@ -726,17 +647,13 @@ class ScannerGUI:
             self.sniffing = False
     
     def _sniff_packets(self):
-        """Функция захвата пакетов"""
         try:
             from scapy.all import conf
             
-            # Проверяем доступность pcap
             if not conf.use_pcap:
-                # Используем L3 socket для Windows без Npcap
                 from scapy.all import L3RawSocket
                 conf.L3socket = L3RawSocket
             
-            # Захватываем пакеты
             sniff(prn=self.scanner.detect_ddos_packet, 
                   store=0, 
                   filter="tcp or udp or icmp", 
@@ -762,27 +679,24 @@ class ScannerGUI:
                 self.root.after(0, lambda: messagebox.showerror("Ошибка захвата", f"{error_msg}"))
     
     def stop_sniffing(self):
-        """Остановка захвата трафика"""
         self.sniffing = False
         self.start_sniff_btn.config(text="📡 Захват трафика", bg='#3498db')
         self.status_var.set("✓ Готов к работе | Захват трафика остановлен")
+        self.status_label.config(text="✓ Захват трафика остановлен")
         self.activity_indicator.config(fg='#27ae60')
         self.update_suspicious_table()
     
     def update_suspicious_table(self):
-        """Обновление таблицы подозрительных IP с геолокацией и объемом"""
         for item in self.suspicious_table.get_children():
             self.suspicious_table.delete(item)
             
         suspicious = self.scanner.get_suspicious_ips_list()
         
         for ip_data in suspicious:
-            # Форматируем страну и город
             location = f"{ip_data['country']}, {ip_data['city']}"
             if len(location) > 25:
                 location = location[:22] + "..."
             
-            # Определяем это ping или нет
             ping_mark = "🏓" if ip_data.get('is_ping') else ""
             
             self.suspicious_table.insert('', 'end', values=(
@@ -797,7 +711,6 @@ class ScannerGUI:
             ))
     
     def block_selected_ip(self):
-        """Блокировка выбранного IP"""
         selection = self.suspicious_table.selection()
         if not selection:
             messagebox.showwarning("Внимание", "Выберите IP для блокировки")
@@ -820,7 +733,6 @@ class ScannerGUI:
             messagebox.showerror("Ошибка", msg)
     
     def unblock_selected_ip(self):
-        """Разблокировка выбранного IP"""
         selection = self.blocked_table.selection()
         if not selection:
             messagebox.showwarning("Внимание", "Выберите IP для разблокировки")
@@ -838,14 +750,13 @@ class ScannerGUI:
             messagebox.showerror("Ошибка", msg)
     
     def stop_scan(self):
-        """Остановка сканирования"""
         self.scanner.scanning = False
         self.scan_animation_active = False
         self.status_var.set("⚠ Сканирование остановлено пользователем")
-        self.activity_indicator.config(fg='#f39c12')  # Оранжевый - остановлено
+        self.status_label.config(text="⚠ Сканирование остановлено")
+        self.activity_indicator.config(fg='#f39c12') 
     
     def save_results(self):
-        """Сохранение результатов в JSON"""
         filename = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
